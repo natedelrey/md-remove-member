@@ -20,7 +20,7 @@ app.use(express.json({ limit: '256kb' }));
 // Health check (Railway friendly)
 app.get('/', (req, res) => res.status(200).send('OK'));
 
-// Shared-secret auth
+// Shared-secret auth (Discord bot must send X-Secret-Key header)
 app.use((req, res, next) => {
   const key = req.header('X-Secret-Key');
   if (!key || key !== SERVICE_SECRET) return res.sendStatus(401);
@@ -36,7 +36,7 @@ async function ensureLogin() {
   }
 }
 
-// POST /remove { robloxId } or { username }
+// POST /remove  body: { robloxId: number }  OR  { username: string }
 app.post('/remove', async (req, res) => {
   try {
     await ensureLogin();
