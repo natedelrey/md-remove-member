@@ -1,113 +1,151 @@
-import 'dotenv/config';
-import express from 'express';
-import noblox from 'noblox.js';
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
+import noblox from "noblox.js";
 
-const {
-  PORT,                 // Railway injects this
-  GROUP_ID,
-  ROBLOSECURITY,
-  SERVICE_SECRET
-} = process.env;
+/**
+ * =========================
+ * ENV REQUIRED
+ * =========================
+ * PORT                    (optional; defaults to 8080)
+ * ROBLOSECURITY           (cookie of the ranker account)
+ * ROBLOX_GROUP_ID         (numeric group id)
+ * RANK_SERVICE_SECRET     (shared secret; X-Secret-Key must equal this)
+ */
 
-if (!GROUP_ID || !ROBLOSECURITY || !SERVICE_SECRET) {
-  console.error('Missing GROUP_ID / ROBLOSECURITY / SERVICE_SECRET');
+const PORT = Number(process.env.PORT || 8080);
+const GROUP_ID = Number(process.env.ROBLOX_GROUP_ID || 0);
+const SERVICE_SECRET = process.env.RANK_SERVICE_SECRET || process.env.ROBLOX_REMOVE_SECRET; // allow reuse
+const COOKIE = process.env.ROBLOSECURITY;
+
+if (!COOKIE) {
+  console.error("[fatal] ROBLOSECURITY env not set.");
+  process.exit(1);
+}
+if (!GROUP_ID) {
+  console.error("[fatal] ROBLOX_GROUP_ID env not set/invalid.");
+  process.exit(1);
+}
+if (!SERVICE_SECRET) {
+  console.error("[fatal] RANK_SERVICE_SECRET (or ROBLOX_REMOVE_SECRET) env not set.");
   process.exit(1);
 }
 
 const app = express();
-app.use(express.json({ limit: '256kb' }));
+app.use(cors());
+app.use(bodyParser.json());
 
-// Health check
-app.get('/', (req, res) => res.status(200).send('OK'));
+// ---- Auth & retry helpers ----
+let authed = false;
 
-// Shared-secret auth
-app.use((req, res, next) => {
-  const key = req.header('X-Secret-Key');
-  if (!key || key !== SERVICE_SECRET) return res.sendStatus(401);
-  next();
-});
+async function ensureAuth() {
+  if (authed) return;
+  await noblox.setCookie(COOKIE);
+  // sanity check
+  const me = await noblox.getCurrentUser();
+  if (!me?.UserID) throw new Error("Roblox auth sanity check failed");
+  console.log(`[svc] Authenticated as ${me.UserName} (${me.UserID})`);
+  authed = true;
+}
 
-let loggedIn = false;
-async function ensureLogin() {
-  if (!loggedIn) {
-    await noblox.setCookie(ROBLOSECURITY);
-    loggedIn = true;
-    console.log('Roblox session established');
+function isCsrfError(err) {
+  const msg = String(err?.message || err || "");
+  return /X-?CSRF/i.test(msg) || msg.includes("Did not receive X-CSRF-TOKEN");
+}
+
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function withAuthRetry(fn, tries = 3) {
+  for (let i = 1; i <= tries; i++) {
+    try {
+      await ensureAuth();
+      return await fn();
+    } catch (err) {
+      console.error(`[svc] attempt ${i} failed:`, err?.message || err);
+      if (isCsrfError(err) && i < tries) {
+        authed = false; // force relogin
+        await delay(1500);
+        continue;
+      }
+      throw err;
+    }
   }
 }
 
-/**
- * Exile a user from the group.
- * POST /remove { robloxId } or { username }
- */
-app.post('/remove', async (req, res) => {
+function requireSecret(req, res) {
+  const got = req.get("X-Secret-Key");
+  if (got !== SERVICE_SECRET) {
+    res.status(401).json({ error: "unauthorized" });
+    return false;
+  }
+  return true;
+}
+
+// ---- Routes ----
+
+// Health check (also verifies login)
+app.get("/health", async (req, res) => {
   try {
-    await ensureLogin();
-    let { robloxId, username } = req.body || {};
-    if (!robloxId && username) {
-      robloxId = await noblox.getIdFromUsername(username).catch(() => null);
-    }
-    if (!robloxId || isNaN(Number(robloxId))) {
-      return res.status(400).json({ error: 'robloxId (or valid username) required' });
-    }
-    await noblox.exile(Number(GROUP_ID), Number(robloxId));
-    return res.status(200).json({ ok: true, robloxId: Number(robloxId) });
-  } catch (err) {
-    console.error('Removal failed:', err?.response?.data || err);
-    return res.status(500).json({ error: 'removal_failed' });
+    await ensureAuth();
+    res.json({ ok: true, groupId: GROUP_ID });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
 });
 
-/**
- * Get list of group roles (id, name, rank number)
- * GET /ranks
- */
-app.get('/ranks', async (req, res) => {
+// Get roles/ranks for the group (used for /rank autocomplete)
+app.get("/ranks", async (req, res) => {
+  if (!requireSecret(req, res)) return;
   try {
-    await ensureLogin();
-    const roles = await noblox.getRoles(Number(GROUP_ID)); // [{id, name, rank}]
-    // Filter out Guest if present (rank 0)
-    const filtered = roles.filter(r => r.rank > 0);
-    return res.status(200).json({ ok: true, roles: filtered });
-  } catch (err) {
-    console.error('Get ranks failed:', err?.response?.data || err);
-    return res.status(500).json({ error: 'get_ranks_failed' });
+    const roles = await withAuthRetry(() => noblox.getRoles(GROUP_ID));
+    // roles: [{ id, name, rank }, ...]
+    res.json({ roles });
+  } catch (e) {
+    console.error("[/ranks] error:", e?.message || e);
+    res.status(500).json({ error: "ranks_failed" });
   }
 });
 
-/**
- * Set a user to a specific role by id or rank number
- * POST /set-rank { robloxId, roleId? , rankNumber? }
- */
-app.post('/set-rank', async (req, res) => {
+// Set a user's rank (roleId OR rankNumber)
+app.post("/set-rank", async (req, res) => {
+  if (!requireSecret(req, res)) return;
+
+  const { robloxId, roleId, rankNumber } = req.body || {};
+  if (!robloxId || (roleId == null && rankNumber == null)) {
+    return res.status(400).json({ error: "missing_params" });
+  }
+
   try {
-    await ensureLogin();
-    const { robloxId, roleId, rankNumber } = req.body || {};
-    if (!robloxId || isNaN(Number(robloxId))) {
-      return res.status(400).json({ error: 'robloxId required' });
-    }
-    let targetRank = rankNumber;
-
-    if (!targetRank && roleId) {
-      const roles = await noblox.getRoles(Number(GROUP_ID));
-      const role = roles.find(r => Number(r.id) === Number(roleId));
-      if (!role) return res.status(400).json({ error: 'invalid_roleId' });
-      targetRank = role.rank;
-    }
-    if (!targetRank || isNaN(Number(targetRank))) {
-      return res.status(400).json({ error: 'rankNumber or roleId required' });
-    }
-
-    // noblox.setRank(groupId, userId, rankNumber)
-    await noblox.setRank(Number(GROUP_ID), Number(robloxId), Number(targetRank));
-    return res.status(200).json({ ok: true, robloxId: Number(robloxId), rankNumber: Number(targetRank) });
-  } catch (err) {
-    console.error('Set rank failed:', err?.response?.data || err);
-    return res.status(500).json({ error: 'set_rank_failed' });
+    await withAuthRetry(async () => {
+      if (roleId != null) {
+        await noblox.setRank({ group: GROUP_ID, target: Number(robloxId), role: Number(roleId) });
+      } else {
+        await noblox.setRank({ group: GROUP_ID, target: Number(robloxId), rank: Number(rankNumber) });
+      }
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Set rank failed:", e?.message || e);
+    res.status(500).json({ error: "set_rank_failed" });
   }
 });
 
-const port = Number(PORT) || 8081;
-app.listen(port, '0.0.0.0', () => {
-  console.log(`Roblox service listening on :${port}`);
+// Remove/exile a user from the group (used by Python on orientation expiry)
+app.post("/remove", async (req, res) => {
+  if (!requireSecret(req, res)) return;
+
+  const { robloxId } = req.body || {};
+  if (!robloxId) return res.status(400).json({ error: "missing_robloxId" });
+
+  try {
+    await withAuthRetry(() => noblox.exile(GROUP_ID, Number(robloxId)));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("Remove (exile) failed:", e?.message || e);
+    res.status(500).json({ error: "remove_failed" });
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Roblox service listening on :${PORT}`);
 });
